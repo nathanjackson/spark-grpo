@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 import transformers
 
-import IPython
-
 import blackjack
 
 # Shape Constant Meanings:
