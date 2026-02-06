@@ -5,7 +5,7 @@ import torch
 import transformers
 
 import blackjack
-from grpo import _build_action_token_sequences, _make_prefix_allowed_tokens_fn
+from train import _build_action_token_sequences, _make_prefix_allowed_tokens_fn
 
 
 def _format_visible_state(game):
