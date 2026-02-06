@@ -324,6 +324,7 @@ if "__main__" == __name__:
 
     eval_every = 100
     eval_games = 1000
+    eval_seed = 1337
     train_temperature = 1.6
     max_seq_len = 384
     groups_per_batch = 4
@@ -333,6 +334,8 @@ if "__main__" == __name__:
     ppo_epochs = 2
 
     def run_eval(step_label):
+        py_state = random.getstate()
+        random.seed(eval_seed)
         policy_model.eval()
         wins = 0
         losses = 0
@@ -366,6 +369,7 @@ if "__main__" == __name__:
             )
         checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
         policy_model.save_pretrained(checkpoint_dir)
+        random.setstate(py_state)
 
     run_eval("init")
     for step in range(total_steps):
