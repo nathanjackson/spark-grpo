@@ -1,5 +1,3 @@
-import copy
-import random
 import logging
 import os
 from datetime import datetime
@@ -9,7 +7,7 @@ import torch.nn.functional as F
 import transformers
 
 import blackjack
-from grpo import grpo_token_level_loss
+from grpo import train_grpo
 
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 
@@ -249,265 +247,25 @@ if "__main__" == __name__:
     entropy_coef = 0.03
     ppo_epochs = 2
 
-    def run_eval(step_label):
-        py_state = random.getstate()
-        random.seed(eval_seed)
-        policy_model.eval()
-        wins = 0
-        losses = 0
-        pushes = 0
-        with torch.no_grad():
-            for _ in tqdm(range(eval_games)):
-                eval_game = blackjack.Blackjack()
-                eval_game.start_round()
-                eval_traj = generate_trajectory(
-                    eval_game,
-                    tokenizer,
-                    policy_model,
-                    temperature=1.0,
-                )
-                if eval_traj["reward"] == 2.0:
-                    wins += 1
-                elif eval_traj["reward"] == 1.0:
-                    pushes += 1
-                else:
-                    losses += 1
-        total = wins + losses + pushes
-        if total > 0:
-            win_rate = wins / total
-            logger.info(
-                "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s",
-                step_label,
-                win_rate,
-                wins,
-                pushes,
-                losses,
-            )
-        checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
-        policy_model.save_pretrained(checkpoint_dir)
-        random.setstate(py_state)
-
-    run_eval("init")
-    for step in range(total_steps):
-        batch_ids = None
-        batch_rewards = None
-        batch_actions = None
-        batch_old_logprobs = None
-        batch_group_ids = []
-        policy_model.eval()
-        for group_idx in range(groups_per_batch):
-            game = blackjack.Blackjack()
-            game.start_round()
-            for _ in range(rollouts_per_group):
-                current_game = copy.deepcopy(game)
-                trajectory = generate_trajectory(
-                    current_game,
-                    tokenizer,
-                    policy_model,
-                    temperature=train_temperature,
-                )
-                batch_group_ids.append(group_idx)
-                #print(f"action_mask from generation length: {trajectory['action_mask'].shape[0]}")
-                #print(f"sequence_ids length: {trajectory['sequence_ids'].shape[0]}")
-    
-                #sequence_text = tokenizer.apply_chat_template(trajectory["messages"], tokenize=False)[:-1]
-                #print(sequence_text)
-                #sequence_encoding = tokenizer(sequence_text, return_tensors="pt", padding="max_length", max_length=512).to(ref_model.device)
-                #print(f"re-tokenized non-pad length: {(sequence_encoding.input_ids != tokenizer.pad_token_id).sum().item()}")
-                sequence_ids = trajectory["sequence_ids"]
-                if sequence_ids.shape[0] > max_seq_len:
-                    sequence_ids = sequence_ids[-max_seq_len:]
-                #print("sequence ids shape:", sequence_ids.shape)
-                sequence_padding = torch.full((max_seq_len - sequence_ids.shape[0], ), tokenizer.pad_token_id, dtype=torch.long).to(ref_model.device)
-                sequence_ids = torch.cat((sequence_ids, sequence_padding)).unsqueeze(0)
-                #print("sequence ids shape:", sequence_ids.shape)
-
-                if batch_ids is None:
-                    batch_ids = sequence_ids
-                else:
-                    batch_ids = torch.cat((batch_ids, sequence_ids))
-
-                rewards = trajectory["token_rewards"]
-                if rewards.shape[0] > max_seq_len:
-                    rewards = rewards[-max_seq_len:]
-                reward_padding = torch.zeros((max_seq_len - rewards.shape[0], ), dtype=rewards.dtype).to(ref_model.device)
-                rewards = torch.cat((rewards, reward_padding)).unsqueeze(0)
-                if batch_rewards is None:
-                    batch_rewards = rewards
-                else:
-                    batch_rewards = torch.cat((batch_rewards, rewards))
-
-                #print("actions mask shape:", trajectory["action_mask"].shape)
-                action_mask = trajectory["action_mask"]
-                if action_mask.shape[0] > max_seq_len:
-                    action_mask = action_mask[-max_seq_len:]
-                action_padding = torch.zeros((max_seq_len - action_mask.shape[0], ), dtype=torch.bool).to(ref_model.device)
-                action_mask = torch.cat((action_mask, action_padding))
-
-                #print(f"After padding - action_mask shape: {action_mask.shape}")
-                #print(f"After padding - action_mask sum: {action_mask.sum()}")
-                #print(f"sequence_ids shape: {sequence_ids.shape}")
-                #print(f"Pad token positions: {(sequence_ids == tokenizer.pad_token_id).sum()}")
-
-                #token_list = tokenizer.convert_ids_to_tokens(sequence_ids[0].tolist())
-                #for idx in ((action_mask == 1).nonzero().squeeze(1).tolist()):
-                #    print(idx)
-                #    print(token_list[idx])
-
-                action_mask = action_mask.unsqueeze(0)
-
-                #print("action mask:", action_mask)
-                if batch_actions is None:
-                    batch_actions = action_mask
-                else:
-                    batch_actions = torch.cat((batch_actions, action_mask))
-                #print("batch actions shape:", batch_actions.shape)
-
-                old_lp = trajectory["old_logprobs"]
-                if old_lp.shape[0] > (max_seq_len - 1):
-                    old_lp = old_lp[-(max_seq_len - 1):]
-                old_lp_padding = torch.full((max_seq_len - 1 - old_lp.shape[0], ), 0.0, dtype=old_lp.dtype).to(ref_model.device)
-                old_lp = torch.cat((old_lp, old_lp_padding)).unsqueeze(0)
-                if batch_old_logprobs is None:
-                    batch_old_logprobs = old_lp
-                else:
-                    batch_old_logprobs = torch.cat((batch_old_logprobs, old_lp))
-
-        ref_model.eval()
-        # ref_logprobs from a frozen reference model
-        with torch.no_grad():
-            ref_logits = ref_model(batch_ids).logits
-            ref_logprobs = F.log_softmax(ref_logits, dim=-1)
-            ref_logprobs = ref_logprobs[:, :-1, :].gather(
-                -1, batch_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-
-        #print(f"batch_actions shape before shift: {batch_actions.shape}")    
-        batch_actions = batch_actions[:, 1:]
-        batch_rewards = batch_rewards[:, 1:]
-        #print(f"batch_actions shape after shift: {batch_actions.shape}")
-        #print(f"batch_actions sum: {batch_actions.sum()}")
-        #print(f"batch_rewards unique: {batch_rewards[batch_actions].unique()}")
-        #print(f"First sample action positions: {batch_actions[0].nonzero().squeeze()}")
-        #print(f"batch_actions shape: {batch_actions.shape}")
-        #print(f"batch_actions sum per sample: {batch_actions.sum(dim=1)}")
-        #print(f"batch_rewards shape: {batch_rewards.shape}")
-
-        #IPython.embed()
-        # distribute reward to actions
-        valid_rewards = batch_rewards[batch_actions]
-        if valid_rewards.numel() == 0:
-            reward_mean = torch.tensor(0.0, device=valid_rewards.device)
-            reward_std = torch.tensor(0.0, device=valid_rewards.device)
-        else:
-            reward_mean = valid_rewards.mean()
-            reward_std = valid_rewards.std()
-        #batch_rewards = batch_actions * (batch_rewards[:,0] / batch_actions.sum(dim=1)).unsqueeze(0).T
-
-        #valid_rewards = batch_rewards[batch_actions]
-        #print(f"Valid rewards: {valid_rewards}")
-        #print(f"Unique rewards: {valid_rewards.unique()}")
-        #print(f"Reward mean: {valid_rewards.mean()}")
-        #print(f"Reward std: {valid_rewards.std()}")
-        # KL Coef for stability
-        group_ids = torch.tensor(batch_group_ids, device=batch_ids.device, dtype=torch.long)
-        last_loss = None
-        last_grad_norm = None
-        last_policy_logprobs = None
-        for _ in range(ppo_epochs):
-            policy_model.eval()
-            policy_logits = policy_model(batch_ids).logits
-            policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
-            policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
-                -1, batch_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-
-            loss = grpo_token_level_loss(
-                policy_logprobs,
-                batch_old_logprobs,
-                ref_logprobs,
-                batch_rewards,
-                batch_actions,
-                group_ids=group_ids,
-                kl_coef=kl_coef,
-            )
-            entropy = -(policy_logprobs_full.exp() * policy_logprobs_full).sum(dim=-1)[:, :-1]
-            entropy_denom = batch_actions.sum(dim=1).clamp_min(1.0)
-            entropy_mean = (entropy * batch_actions).sum(dim=1) / entropy_denom
-            loss = loss - entropy_coef * entropy_mean.mean()
-
-            policy_model.train()
-            optim.zero_grad()
-            loss.backward()
-
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy_model.parameters(), max_norm=1.0)
-            if grad_norm == 0.0 and loss.item() != 0.0:
-                valid_action_count = batch_actions.sum().item()
-                any_grad = any(
-                    (p.grad is not None) and torch.any(p.grad != 0).item()
-                    for p in policy_model.parameters()
-                )
-                logger.warning(
-                    "[debug] zero grad_norm with nonzero loss"
-                    "\tloss_requires_grad: %s"
-                    "\tpolicy_logprobs_requires_grad: %s"
-                    "\tvalid_action_tokens: %s"
-                    "\tany_nonzero_grad: %s",
-                    loss.requires_grad,
-                    policy_logprobs.requires_grad,
-                    int(valid_action_count),
-                    any_grad,
-                )
-            optim.step()
-            last_loss = loss
-            last_grad_norm = grad_norm
-            last_policy_logprobs = policy_logprobs.detach()
-
-        lr = None
-        for param_group in optim.param_groups:
-            lr = param_group['lr']
-
-        # Debug stats to track collapse
-        mask_f = batch_actions.float()
-        denom = mask_f.sum(dim=1).clamp_min(1.0)
-        sample_rewards = (batch_rewards * mask_f).sum(dim=1) / denom
-        sample_rewards_std = sample_rewards.std(unbiased=False)
-        sample_rewards_mean = sample_rewards.mean()
-        adv = ((sample_rewards - sample_rewards_mean) / sample_rewards_std.clamp(min=1e-8)).unsqueeze(1) * mask_f
-        adv_abs_mean = adv.abs().mean()
-        policy_logprobs = last_policy_logprobs
-        loss = last_loss
-        grad_norm = last_grad_norm
-        ratio = torch.exp(policy_logprobs - batch_old_logprobs)
-        if batch_actions.any():
-            ratio_vals = ratio[batch_actions]
-            ratio_mean = ratio_vals.mean()
-            ratio_std = ratio_vals.std(unbiased=False)
-            valid_action_tokens = int(batch_actions.sum().item())
-        else:
-            ratio_mean = torch.tensor(0.0, device=policy_logprobs.device)
-            ratio_std = torch.tensor(0.0, device=policy_logprobs.device)
-            valid_action_tokens = 0
-        logger.info(
-            "step: %s\tloss: %.20f\tgrad_norm: %.8f\tlr: %s\treward_mean: %.4f\treward_std: %.4f"
-            "\tsample_reward_std: %.6f\tadv_abs_mean: %.6f\tratio_mean: %.6f\tratio_std: %.6f\tvalid_action_tokens: %s",
-            step,
-            loss.item(),
-            grad_norm,
-            lr,
-            reward_mean.item(),
-            reward_std.item(),
-            sample_rewards_std.item(),
-            adv_abs_mean.item(),
-            ratio_mean.item(),
-            ratio_std.item(),
-            valid_action_tokens,
-        )
-
-        sched.step()
-
-        if step > 0 and step % eval_every == 0:
-            run_eval(step)
-
-        #if grad_norm > 50.:
-        #    break
+    train_grpo(
+        policy_model=policy_model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        optim=optim,
+        sched=sched,
+        logger=logger,
+        run_dir=run_dir,
+        total_steps=total_steps,
+        eval_every=eval_every,
+        eval_games=eval_games,
+        eval_seed=eval_seed,
+        train_temperature=train_temperature,
+        max_seq_len=max_seq_len,
+        groups_per_batch=groups_per_batch,
+        rollouts_per_group=rollouts_per_group,
+        kl_coef=kl_coef,
+        entropy_coef=entropy_coef,
+        ppo_epochs=ppo_epochs,
+        generate_trajectory=generate_trajectory,
+        game_cls=blackjack.Blackjack,
+    )
