@@ -141,7 +141,7 @@ def train_grpo(
     if eval_iter_factory is None:
         eval_iter_factory = range
 
-    def run_eval(step_label):
+    def run_eval(step_label, eval_model):
         py_state = random.getstate()
         random.seed(eval_seed)
         policy_model.eval()
@@ -155,7 +155,7 @@ def train_grpo(
                 eval_traj = generate_trajectory(
                     eval_game,
                     tokenizer,
-                    policy_model,
+                    eval_model,
                     temperature=1.0,
                 )
                 if eval_traj["reward"] == 2.0:
@@ -176,10 +176,10 @@ def train_grpo(
                 losses,
             )
         checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
-        policy_model.save_pretrained(checkpoint_dir)
+        eval_model.save_pretrained(checkpoint_dir)
         random.setstate(py_state)
 
-    run_eval("init")
+    run_eval("init", ref_model)
     for step in range(total_steps):
         batch_ids = None
         batch_rewards = None
@@ -420,7 +420,7 @@ def train_grpo(
         sched.step()
 
         if step > 0 and step % eval_every == 0:
-            run_eval(step)
+            run_eval(step, policy_model)
 
         #if grad_norm > 50.:
         #    break

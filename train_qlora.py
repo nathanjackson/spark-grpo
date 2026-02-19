@@ -193,8 +193,7 @@ if "__main__" == __name__:
         bnb_4bit_compute_dtype=torch.bfloat16
     )
 
-    model_id = "ibm-granite/granite-3.3-8b-instruct"
-    #model_id = "Qwen/Qwen2-0.5B-Instruct"
+    model_id = "ibm-granite/granite-4.0-micro"
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
@@ -207,16 +206,17 @@ if "__main__" == __name__:
     policy_model = prepare_model_for_kbit_training(policy_model)
 
     lora_config = LoraConfig(
-        r=8,
+        # rule of thumb: for dense rewards, use 32+ for rank. since we're doing token-level rewards, we have dense rewards
+        r=32,
         lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],
+        target_modules="all-linear",
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
     )
     policy_model = get_peft_model(policy_model, lora_config)
 
-    base_lr = 5e-6
+    base_lr = 5e-5
     total_steps = 10000
     warmup_steps = 20
     optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
