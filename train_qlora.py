@@ -36,24 +36,45 @@ if "__main__" == __name__:
     )
 
     model_id = "ibm-granite/granite-4.0-micro"
+
+    # Setup Tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
-    ref_model = transformers.AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config).to("cuda")
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False  # Freeze all parameters
-    policy_model = transformers.AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config).to("cuda")
-    policy_model.gradient_checkpointing_enable()
-    policy_model = prepare_model_for_kbit_training(policy_model)
 
+    # Load model
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_id,
+        quantization_config=bnb_config,
+        device_map="cuda"
+    )
+    model.gradient_checkpointing_enable()
+    model = prepare_model_for_kbit_training(model)
+
+    # Setup adapter
     lora_config = LoraConfig(
         # rule of thumb: for dense rewards, use 32+ for rank. since we're doing token-level rewards, we have dense rewards
         r=32,
         lora_alpha=32,
         target_modules="all-linear"
     )
-    policy_model = get_peft_model(policy_model, lora_config)
+    model = get_peft_model(model, lora_config)
+
+    class ReferenceModelProxy:
+        """Proxy class that disables the Lora adapter"""
+        def __init__(self, model):
+            self.model = model
+
+        def __getattr__(self, key):
+            return getattr(self.model, key)
+
+        def __call__(self, *args, **kwargs):
+            self.model.eval()
+            with torch.no_grad(), self.model.disable_adapter():
+                return self.model(*args, **kwargs)
+
+    policy_model = model
+    ref_model = ReferenceModelProxy(model)
 
     base_lr = 5e-6
     total_steps = 10000
