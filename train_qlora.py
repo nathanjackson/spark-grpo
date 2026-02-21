@@ -10,6 +10,7 @@ import blackjack
 from grpo import train_grpo
 
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+import bitsandbytes as bnb
 
 
 if "__main__" == __name__:
@@ -79,7 +80,7 @@ if "__main__" == __name__:
     base_lr = 5e-6
     total_steps = 10000
     warmup_steps = 20
-    optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
+    optim = bnb.optim.AdamW8bit(policy_model.parameters(), lr=base_lr)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optim,
         start_factor=1.0 / max(1, warmup_steps),
