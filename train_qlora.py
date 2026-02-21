@@ -51,14 +51,11 @@ if "__main__" == __name__:
         # rule of thumb: for dense rewards, use 32+ for rank. since we're doing token-level rewards, we have dense rewards
         r=32,
         lora_alpha=32,
-        target_modules="all-linear",
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
+        target_modules="all-linear"
     )
     policy_model = get_peft_model(policy_model, lora_config)
 
-    base_lr = 5e-5
+    base_lr = 5e-6
     total_steps = 10000
     warmup_steps = 20
     optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
