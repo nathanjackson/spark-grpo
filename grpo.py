@@ -144,7 +144,7 @@ def train_grpo(
     def run_eval(step_label, eval_model):
         py_state = random.getstate()
         random.seed(eval_seed)
-        policy_model.eval()
+        eval_model.eval()
         wins = 0
         losses = 0
         pushes = 0
