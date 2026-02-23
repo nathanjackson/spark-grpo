@@ -7,7 +7,7 @@ from peft import PeftModel
 from transformers import BitsAndBytesConfig
 
 import blackjack
-from train import _build_action_token_sequences, _make_prefix_allowed_tokens_fn
+from blackjack import _build_action_token_sequences, _make_prefix_allowed_tokens_fn
 
 
 def _format_visible_state(game):
@@ -106,7 +106,7 @@ def play_game(game_id, tokenizer, model, temperature):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path")
-    parser.add_argument("--model-id", default="ibm-granite/granite-3.3-8b-instruct")
+    parser.add_argument("--model-id", default="ibm-granite/granite-4.0-micro")
     parser.add_argument("--adapter-path")
     parser.add_argument("--games", type=int, default=1000)
     parser.add_argument("--temperature", type=float, default=1.0)
