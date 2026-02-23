@@ -134,6 +134,7 @@ def train_grpo(
     kl_coef,
     entropy_coef,
     ppo_epochs,
+    grad_accum_steps=1,
     generate_trajectory,
     game_cls,
     eval_iter_factory=None,
@@ -325,30 +326,52 @@ def train_grpo(
         last_grad_norm = None
         last_policy_logprobs = None
         for _ in range(ppo_epochs):
-            policy_model.eval()
-            policy_logits = policy_model(batch_ids).logits
-            policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
-            policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
-                -1, batch_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-
-            loss = grpo_token_level_loss(
-                policy_logprobs,
-                batch_old_logprobs,
-                ref_logprobs,
-                batch_rewards,
-                batch_actions,
-                group_ids=group_ids,
-                kl_coef=kl_coef,
-            )
-            entropy = -(policy_logprobs_full.exp() * policy_logprobs_full).sum(dim=-1)[:, :-1]
-            entropy_denom = batch_actions.sum(dim=1).clamp_min(1.0)
-            entropy_mean = (entropy * batch_actions).sum(dim=1) / entropy_denom
-            loss = loss - entropy_coef * entropy_mean.mean()
-
             policy_model.train()
             optim.zero_grad()
-            loss.backward()
+            total_batch = batch_ids.shape[0]
+            accum_steps = max(1, int(grad_accum_steps))
+            chunk_count = min(accum_steps, total_batch)
+            loss_accum = None
+            policy_logprobs_chunks = []
+            for mb_ids, mb_old_logprobs, mb_ref_logprobs, mb_rewards, mb_actions, mb_group_ids in zip(
+                torch.chunk(batch_ids, chunk_count),
+                torch.chunk(batch_old_logprobs, chunk_count),
+                torch.chunk(ref_logprobs, chunk_count),
+                torch.chunk(batch_rewards, chunk_count),
+                torch.chunk(batch_actions, chunk_count),
+                torch.chunk(group_ids, chunk_count),
+            ):
+                mb_size = mb_ids.shape[0]
+                if mb_size == 0:
+                    continue
+                policy_model.eval()
+                policy_logits = policy_model(mb_ids).logits
+                policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
+                policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
+                    -1, mb_ids[:, 1:].unsqueeze(-1)
+                ).squeeze(-1)
+
+                mb_loss = grpo_token_level_loss(
+                    policy_logprobs,
+                    mb_old_logprobs,
+                    mb_ref_logprobs,
+                    mb_rewards,
+                    mb_actions,
+                    group_ids=mb_group_ids,
+                    kl_coef=kl_coef,
+                )
+                entropy = -(policy_logprobs_full.exp() * policy_logprobs_full).sum(dim=-1)[:, :-1]
+                entropy_denom = mb_actions.sum(dim=1).clamp_min(1.0)
+                entropy_mean = (entropy * mb_actions).sum(dim=1) / entropy_denom
+                mb_loss = mb_loss - entropy_coef * entropy_mean.mean()
+
+                scale = mb_size / total_batch
+                (mb_loss * scale).backward()
+                if loss_accum is None:
+                    loss_accum = mb_loss.detach() * scale
+                else:
+                    loss_accum = loss_accum + (mb_loss.detach() * scale)
+                policy_logprobs_chunks.append(policy_logprobs.detach())
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 policy_model.parameters(),
@@ -372,9 +395,12 @@ def train_grpo(
                     any_grad,
                 )
             optim.step()
-            last_loss = loss
+            last_loss = loss_accum
             last_grad_norm = grad_norm
-            last_policy_logprobs = policy_logprobs.detach()
+            if policy_logprobs_chunks:
+                last_policy_logprobs = torch.cat(policy_logprobs_chunks, dim=0)
+            else:
+                last_policy_logprobs = None
 
         lr = None
         for param_group in optim.param_groups:
@@ -388,8 +414,14 @@ def train_grpo(
         sample_rewards_mean = sample_rewards.mean()
         adv = ((sample_rewards - sample_rewards_mean) / sample_rewards_std.clamp(min=1e-8)).unsqueeze(1) * mask_f
         adv_abs_mean = adv.abs().mean()
-        policy_logprobs = last_policy_logprobs
-        loss = last_loss
+        if last_policy_logprobs is None:
+            policy_logprobs = batch_old_logprobs.detach()
+        else:
+            policy_logprobs = last_policy_logprobs
+        if last_loss is None:
+            loss = torch.tensor(0.0, device=policy_logprobs.device)
+        else:
+            loss = last_loss
         grad_norm = last_grad_norm
         ratio = torch.exp(policy_logprobs - batch_old_logprobs)
         if batch_actions.any():

@@ -66,6 +66,7 @@ if "__main__" == __name__:
     kl_coef = 0.2
     entropy_coef = 0.03
     ppo_epochs = 2
+    grad_accum_steps = 4
 
     train_grpo(
         policy_model=policy_model,
@@ -86,6 +87,7 @@ if "__main__" == __name__:
         kl_coef=kl_coef,
         entropy_coef=entropy_coef,
         ppo_epochs=ppo_epochs,
+        grad_accum_steps=grad_accum_steps,
         generate_trajectory=blackjack.generate_trajectory,
         game_cls=blackjack.Blackjack,
     )
