@@ -142,7 +142,7 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
 
     invalid_action = False
     sequence_ids = None
-    #print("start game")
+    print("start game")
     while not game.get_state()["game_over"]:
         visible_state = {
             "your_hand": game.get_state()["player_hand"],
@@ -152,9 +152,13 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         #print(state_str)
         messages.append({ "role": "user", "content": state_str })
 
-        messages_text = tokenizer.apply_chat_template(messages, tokenize=False,
-            add_generation_prompt=True)
-        #print(messages_text)
+        messages_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            reasoning_effort="low"
+        )
+        print(messages_text)
         messages_encoding = tokenizer(messages_text, return_tensors="pt").to(device)
 
         prompt_len = messages_encoding.input_ids.shape[1]
@@ -167,12 +171,12 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         with torch.no_grad():
             outputs = model.generate(
                 **messages_encoding,
-                max_new_tokens=4,
+                max_new_tokens=256,
                 temperature=temperature,
                 pad_token_id=tokenizer.pad_token_id,
                 do_sample=True,
                 return_dict_in_generate=True,
-                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                #prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
             )
         sequence_ids = outputs.sequences[0]
         action_ids = outputs.sequences[0, prompt_len:].unsqueeze(0)
@@ -189,13 +193,25 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             token_rewards = torch.cat((token_rewards, torch.zeros(new_ids.shape[0], dtype=torch.float32, device=device)), dim=0)
         #action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
         #print(action_mask)
-        action = tokenizer.batch_decode(action_ids, skip_special_tokens=True)[0]
-        action = action.strip().upper()
-        #print(f"Action: {action}")
+        action = tokenizer.batch_decode(action_ids)[0]
+        #action = action.strip()
+        print(f"Action Shape: {action_mask.shape}")
+        print(f"Action: {action}")
         #print(f"Action token IDs: {action_ids[0].tolist()}")
         #print(f"Mask for these tokens: {action_mask[messages_encoding.input_ids.shape[1]:messages_encoding.input_ids.shape[1]+len(action_ids[0])].tolist()}")
-        messages.append({ "role": "assistant", "content": action})
-        #print(action)
+        # Extract thinking
+        s = action.rfind("<|channel|>analysis<|message|>") + len("<|channel|>analysis<|message|>")
+        e = action.rfind("<|end|>")
+        thinking = action[s:e]
+
+        # Extract action
+        s = action.rfind("<|message|>") + len("<|message|>")
+        e = action.rfind("<|return|>")
+        action = action[s:e]
+
+        print(thinking)
+        print("extracted:", action)
+        messages.append({ "role": "assistant", "content": action, "thinking": thinking })
 
         if action == "HIT":
             #print("model hits")
