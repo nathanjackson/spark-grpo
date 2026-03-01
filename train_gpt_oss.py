@@ -106,7 +106,7 @@ if "__main__" == __name__:
     )
 
     eval_every = 100
-    eval_games = 5
+    eval_games = 1000
     eval_seed = 1337
     train_temperature = 2.0
     max_seq_len = 512

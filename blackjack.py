@@ -4,6 +4,10 @@ import torch
 
 import torch.nn.functional as F
 
+import openai_harmony as H
+
+harmony_encoding = H.load_harmony_encoding(H.HarmonyEncodingName.HARMONY_GPT_OSS)
+
 class Blackjack:
     def __init__(self):
         self.deck = self._create_deck()
@@ -142,7 +146,16 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
 
     invalid_action = False
     sequence_ids = None
-    print("start game")
+    #print("start game")
+    def _mark_action_tokens(action_mask, prompt_len, response_ids, eos_token_id):
+        # Ensure the mask is long enough for this prompt + response.
+        needed = prompt_len + response_ids.shape[0]
+        if action_mask.shape[0] < needed:
+            pad = torch.zeros(needed - action_mask.shape[0], dtype=torch.bool, device=action_mask.device)
+            action_mask = torch.cat((action_mask, pad), dim=0)
+        non_eos = response_ids != eos_token_id
+        action_mask[prompt_len:prompt_len + response_ids.shape[0]] |= non_eos
+        return action_mask
     while not game.get_state()["game_over"]:
         visible_state = {
             "your_hand": game.get_state()["player_hand"],
@@ -158,7 +171,7 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             add_generation_prompt=True,
             reasoning_effort="low"
         )
-        print(messages_text)
+        #print(messages_text)
         messages_encoding = tokenizer(messages_text, return_tensors="pt").to(device)
 
         prompt_len = messages_encoding.input_ids.shape[1]
@@ -180,6 +193,8 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             )
         sequence_ids = outputs.sequences[0]
         action_ids = outputs.sequences[0, prompt_len:].unsqueeze(0)
+        parsed = harmony_encoding.parse_messages_from_completion_tokens(action_ids[0], role=H.Role.ASSISTANT)
+        #print("parsed:", parsed)
         if action_mask is None:
             action_mask = torch.zeros(outputs.sequences.shape[1], dtype=torch.bool).to(device)
         else:
@@ -195,36 +210,34 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         #print(action_mask)
         action = tokenizer.batch_decode(action_ids)[0]
         #action = action.strip()
-        print(f"Action Shape: {action_mask.shape}")
-        print(f"Action: {action}")
+        #print(f"Action Shape: {action_mask.shape}")
+        #print(f"Action: {action}")
         #print(f"Action token IDs: {action_ids[0].tolist()}")
         #print(f"Mask for these tokens: {action_mask[messages_encoding.input_ids.shape[1]:messages_encoding.input_ids.shape[1]+len(action_ids[0])].tolist()}")
         # Extract thinking
-        s = action.rfind("<|channel|>analysis<|message|>") + len("<|channel|>analysis<|message|>")
-        e = action.rfind("<|end|>")
-        thinking = action[s:e]
+        thinking = parsed[0].content[0].text
+        #print("thinking:", thinking)
 
         # Extract action
-        s = action.rfind("<|message|>") + len("<|message|>")
-        e = action.rfind("<|return|>")
-        action = action[s:e]
+        action = parsed[1].content[0].text
+        #print("action:", action)
 
-        print(thinking)
-        print("extracted:", action)
+        #print(thinking)
+        #print("extracted:", action)
         messages.append({ "role": "assistant", "content": action, "thinking": thinking })
 
         if action == "HIT":
             #print("model hits")
             observation = game.hit()
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
+            action_mask = _mark_action_tokens(action_mask, prompt_len, response_ids, tokenizer.eos_token_id)
         elif action == "STAY":
             #print("model stays")
             observation = game.stand()
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
+            action_mask = _mark_action_tokens(action_mask, prompt_len, response_ids, tokenizer.eos_token_id)
         else:
             #print("invalid action")
             invalid_action = True
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
+            action_mask = _mark_action_tokens(action_mask, prompt_len, response_ids, tokenizer.eos_token_id)
             #action_mask[messages_encoding.input_ids.shape[1]:] = 1
             break
 
@@ -264,4 +277,3 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         "token_rewards": token_rewards,
         "reward": reward
     }
-
