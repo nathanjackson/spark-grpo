@@ -193,8 +193,6 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             )
         sequence_ids = outputs.sequences[0]
         action_ids = outputs.sequences[0, prompt_len:].unsqueeze(0)
-        parsed = harmony_encoding.parse_messages_from_completion_tokens(action_ids[0], role=H.Role.ASSISTANT)
-        #print("parsed:", parsed)
         if action_mask is None:
             action_mask = torch.zeros(outputs.sequences.shape[1], dtype=torch.bool).to(device)
         else:
@@ -214,13 +212,19 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         #print(f"Action: {action}")
         #print(f"Action token IDs: {action_ids[0].tolist()}")
         #print(f"Mask for these tokens: {action_mask[messages_encoding.input_ids.shape[1]:messages_encoding.input_ids.shape[1]+len(action_ids[0])].tolist()}")
-        # Extract thinking
-        thinking = parsed[0].content[0].text
-        #print("thinking:", thinking)
+        try:
+            parsed = harmony_encoding.parse_messages_from_completion_tokens(action_ids[0], role=H.Role.ASSISTANT)
+            # Extract thinking
+            thinking = parsed[0].content[0].text
+            #print("thinking:", thinking)
 
-        # Extract action
-        action = parsed[1].content[0].text
-        #print("action:", action)
+            # Extract action
+            action = parsed[1].content[0].text
+            #print("action:", action)
+        except H.HarmonyError as e:
+            thinking = "error"
+            action = "error"
+        #print("parsed:", parsed)
 
         #print(thinking)
         #print("extracted:", action)
