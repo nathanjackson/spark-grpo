@@ -221,7 +221,7 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             # Extract action
             action = parsed[1].content[0].text
             #print("action:", action)
-        except H.HarmonyError as e:
+        except (IndexError, H.HarmonyError) as e:
             thinking = "error"
             action = "error"
         #print("parsed:", parsed)
