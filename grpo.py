@@ -149,6 +149,7 @@ def train_grpo(
         wins = 0
         losses = 0
         pushes = 0
+        invalid = 0
         with torch.no_grad():
             for _ in tqdm.tqdm(eval_iter_factory(eval_games)):
                 eval_game = game_cls()
@@ -163,18 +164,23 @@ def train_grpo(
                     wins += 1
                 elif eval_traj["reward"] == 1.0:
                     pushes += 1
-                else:
+                elif eval_traj["reward"] == -1.0:
                     losses += 1
-        total = wins + losses + pushes
+                else:
+                    invalid += 1
+        total = wins + losses + pushes + invalid
         if total > 0:
             win_rate = wins / total
+            invalid_pct = 100.0 * invalid / total
             logger.info(
-                "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s",
+                "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s\tinvalid: %s\tinvalid_pct: %.2f%%",
                 step_label,
                 win_rate,
                 wins,
                 pushes,
                 losses,
+                invalid,
+                invalid_pct,
             )
         checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
         eval_model.save_pretrained(checkpoint_dir)

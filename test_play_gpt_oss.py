@@ -199,7 +199,7 @@ def main():
     )
     print(
         f"Percentages: wins={win_pct:.2f}% pushes={push_pct:.2f}% "
-        f"losses={loss_pct:.2f}% invalid={invalid_pct:.2f}%"
+        f"losses={loss_pct:.2f}% invalid_pct={invalid_pct:.2f}%"
     )
 
 
