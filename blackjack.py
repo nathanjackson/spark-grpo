@@ -129,26 +129,168 @@ def _make_prefix_allowed_tokens_fn(prompt_len, action_seqs, eos_token_id):
         return sorted(allowed) if allowed else ([] if eos_token_id is None else [eos_token_id])
     return prefix_allowed_tokens_fn
 
-def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
+
+def _build_action_candidates(tokenizer):
+    action_variants = {
+        "HIT": ["HIT", " HIT"],
+        "STAY": ["STAY", " STAY"],
+    }
+    candidates = []
+    for action, variants in action_variants.items():
+        token_variants = []
+        for text in variants:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if ids and ids not in token_variants:
+                token_variants.append(ids)
+        if token_variants:
+            candidates.append({
+                "action": action,
+                "variants": token_variants,
+            })
+    return candidates
+
+def _score_token_sequence(model, prompt_ids, attention_mask, token_ids):
+    input_ids = prompt_ids
+    attn_mask = attention_mask
+    total_logprob = torch.tensor(0.0, device=prompt_ids.device)
+
+    for token_id in token_ids:
+        logits = model(input_ids, attention_mask=attn_mask).logits[:, -1, :]
+        logprobs = F.log_softmax(logits, dim=-1)
+        total_logprob = total_logprob + logprobs[0, token_id]
+
+        next_token = torch.tensor([[token_id]], device=prompt_ids.device, dtype=prompt_ids.dtype)
+        input_ids = torch.cat((input_ids, next_token), dim=1)
+        attn_mask = torch.cat((attn_mask, torch.ones_like(next_token)), dim=1)
+
+    return total_logprob
+
+
+def _score_action_candidates(messages_encoding, tokenizer, model):
+    candidates = _build_action_candidates(tokenizer)
+    if not candidates:
+        raise ValueError("Tokenizer could not encode any valid blackjack actions.")
+
+    action_scores = []
+    with torch.no_grad():
+        for candidate in candidates:
+            variant_scores = []
+            for token_ids in candidate["variants"]:
+                score = _score_token_sequence(
+                    model,
+                    messages_encoding.input_ids,
+                    messages_encoding.attention_mask,
+                    token_ids,
+                )
+                variant_scores.append(score)
+
+            stacked_scores = torch.stack(variant_scores)
+            action_scores.append(torch.logsumexp(stacked_scores, dim=0))
+
+    return candidates, torch.stack(action_scores)
+
+
+def _action_instructions():
+    return (
+        "You are playing blackjack. At each step you'll be given the state "
+        "of the game. Respond with HIT or STAY. Do not add commentary."
+    )
+
+
+def _visible_state(game):
+    state = game.get_state()
+    return {
+        "your_hand": state["player_hand"],
+        "dealer_hand": ["Hidden"] + state["dealer_hand"][1:],
+    }
+
+
+def _user_turn_content(game, include_instructions):
+    state_text = str(_visible_state(game))
+    if include_instructions:
+        # Mistral's chat template folds or drops `system` content once assistant
+        # turns are present, which breaks prompt/action span reconstruction.
+        return f"{_action_instructions()}\n\n{state_text}"
+    return state_text
+
+
+def _build_training_sequence(tokenizer, messages, device):
+    final_text = tokenizer.apply_chat_template(messages, tokenize=False)
+    final_encoding = tokenizer(
+        final_text,
+        return_tensors="pt",
+        return_special_tokens_mask=True,
+    ).to(device)
+    sequence_ids = final_encoding.input_ids[0]
+    action_mask = torch.zeros(sequence_ids.shape[0], dtype=torch.bool, device=device)
+
+    replay_messages = []
+    msg_idx = 0
+    while msg_idx + 1 < len(messages):
+        replay_messages.append(messages[msg_idx])
+        prompt_text = tokenizer.apply_chat_template(
+            replay_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_encoding = tokenizer(prompt_text, return_tensors="pt").to(device)
+        prompt_len = prompt_encoding.input_ids.shape[1]
+
+        replay_messages.append(messages[msg_idx + 1])
+        round_text = tokenizer.apply_chat_template(replay_messages, tokenize=False)
+        round_encoding = tokenizer(
+            round_text,
+            return_tensors="pt",
+            return_special_tokens_mask=True,
+        ).to(device)
+        round_len = round_encoding.input_ids.shape[1]
+        suffix_ids = round_encoding.input_ids[0, prompt_len:round_len]
+        suffix_special = round_encoding.special_tokens_mask[0, prompt_len:round_len].bool()
+        suffix_mask = ~suffix_special
+        if tokenizer.eos_token_id is not None:
+            suffix_mask = suffix_mask & (suffix_ids != tokenizer.eos_token_id)
+        if tokenizer.pad_token_id is not None:
+            suffix_mask = suffix_mask & (suffix_ids != tokenizer.pad_token_id)
+        action_mask[prompt_len:round_len] = suffix_mask
+        msg_idx += 2
+
+    return sequence_ids, action_mask
+
+def eval_probe(game, tokenizer, model):
     device = model.device
     messages = [
-        { "role": "system", "content": ("You are playing blackjack. At each "
-            "step you'll be given the state of the game. Respond with HIT or "
-            "STAY. Do not add commentary.")
-        }
+        {"role": "user", "content": _user_turn_content(game, include_instructions=True)},
     ]
-    action_mask = None
-    token_rewards = None
+    messages_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    messages_encoding = tokenizer(messages_text, return_tensors="pt").to(device)
+    candidates, action_scores = _score_action_candidates(
+        messages_encoding,
+        tokenizer,
+        model,
+    )
+    action_probs = F.softmax(action_scores, dim=0)
+    by_action = {
+        candidate["action"]: action_probs[idx].item()
+        for idx, candidate in enumerate(candidates)
+    }
+    return {
+        "p_hit": by_action.get("HIT", 0.0),
+        "p_stay": by_action.get("STAY", 0.0),
+    }
+
+
+def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
+    device = model.device
+    messages = []
 
     invalid_action = False
-    sequence_ids = None
     #print("start game")
     while not game.get_state()["game_over"]:
-        visible_state = {
-            "your_hand": game.get_state()["player_hand"],
-            "dealer_hand": ["Hidden"] + game.get_state()["dealer_hand"][1:]
-        }
-        state_str = str(visible_state)
+        state_str = _user_turn_content(game, include_instructions=not messages)
         #print(state_str)
         messages.append({ "role": "user", "content": state_str })
 
@@ -156,7 +298,6 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             add_generation_prompt=True)
         #print(messages_text)
         messages_encoding = tokenizer(messages_text, return_tensors="pt").to(device)
-
         prompt_len = messages_encoding.input_ids.shape[1]
         action_seqs = _build_action_token_sequences(tokenizer)
         prefix_allowed_tokens_fn = _make_prefix_allowed_tokens_fn(
@@ -164,51 +305,38 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
             action_seqs,
             tokenizer.eos_token_id,
         )
+        generate_kwargs = {
+            "max_new_tokens": 4,
+            "pad_token_id": tokenizer.pad_token_id,
+            "return_dict_in_generate": True,
+            "prefix_allowed_tokens_fn": prefix_allowed_tokens_fn,
+        }
+        if temperature <= 0.0:
+            generate_kwargs["do_sample"] = False
+        else:
+            generate_kwargs["do_sample"] = True
+            generate_kwargs["temperature"] = temperature
         with torch.no_grad():
             outputs = model.generate(
                 **messages_encoding,
-                max_new_tokens=4,
-                temperature=temperature,
-                pad_token_id=tokenizer.pad_token_id,
-                do_sample=True,
-                return_dict_in_generate=True,
-                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                **generate_kwargs,
             )
-        sequence_ids = outputs.sequences[0]
-        action_ids = outputs.sequences[0, prompt_len:].unsqueeze(0)
-        if action_mask is None:
-            action_mask = torch.zeros(outputs.sequences.shape[1], dtype=torch.bool).to(device)
-        else:
-            new_ids = outputs.sequences[0, action_mask.shape[0]:]
-            action_mask = torch.cat((action_mask, torch.zeros(new_ids.shape[0], dtype=torch.bool).to(device)), dim=0)
         response_ids = outputs.sequences[0, prompt_len:]
-        if token_rewards is None:
-            token_rewards = torch.zeros(outputs.sequences.shape[1], dtype=torch.float32, device=device)
-        else:
-            new_ids = outputs.sequences[0, token_rewards.shape[0]:]
-            token_rewards = torch.cat((token_rewards, torch.zeros(new_ids.shape[0], dtype=torch.float32, device=device)), dim=0)
-        #action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
-        #print(action_mask)
-        action = tokenizer.batch_decode(action_ids, skip_special_tokens=True)[0]
+        action = tokenizer.batch_decode(response_ids.unsqueeze(0), skip_special_tokens=True)[0]
         action = action.strip().upper()
         #print(f"Action: {action}")
-        #print(f"Action token IDs: {action_ids[0].tolist()}")
-        #print(f"Mask for these tokens: {action_mask[messages_encoding.input_ids.shape[1]:messages_encoding.input_ids.shape[1]+len(action_ids[0])].tolist()}")
         messages.append({ "role": "assistant", "content": action})
         #print(action)
 
         if action == "HIT":
             #print("model hits")
             observation = game.hit()
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
         elif action == "STAY":
             #print("model stays")
             observation = game.stand()
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
         else:
             #print("invalid action")
             invalid_action = True
-            action_mask[messages_encoding.input_ids.shape[1]:][response_ids != tokenizer.eos_token_id] = 1
             #action_mask[messages_encoding.input_ids.shape[1]:] = 1
             break
 
@@ -226,15 +354,19 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         #print("agent loss")
         reward = -1.
 
-    if token_rewards is None:
-        token_rewards = torch.zeros(sequence_ids.shape[0], dtype=torch.float32, device=device)
+    sequence_ids, action_mask = _build_training_sequence(tokenizer, messages, device)
+    token_rewards = torch.zeros(sequence_ids.shape[0], dtype=torch.float32, device=device)
     token_rewards[action_mask] += reward
 
     #print("Reward:", reward)
     #print("Mask:", action_mask)
 
     with torch.no_grad():
-        logits = model(sequence_ids.unsqueeze(0)).logits
+        sequence_attention_mask = torch.ones_like(sequence_ids.unsqueeze(0))
+        logits = model(
+            sequence_ids.unsqueeze(0),
+            attention_mask=sequence_attention_mask,
+        ).logits
         logprobs = F.log_softmax(logits, dim=-1)
         old_logprobs = logprobs[:, :-1, :].gather(
             -1, sequence_ids.unsqueeze(0)[:, 1:].unsqueeze(-1)
@@ -248,4 +380,3 @@ def generate_trajectory(game, tokenizer, model, temperature: float = 1.0):
         "token_rewards": token_rewards,
         "reward": reward
     }
-

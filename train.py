@@ -25,7 +25,7 @@ if "__main__" == __name__:
     )
     logger = logging.getLogger("grpo")
 
-    model_id = "ibm-granite/granite-4.0-350m"
+    model_id = "Qwen/Qwen3.5-0.8B"
     #model_id = "Qwen/Qwen2-0.5B-Instruct"
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
@@ -38,7 +38,7 @@ if "__main__" == __name__:
 
     base_lr = 5e-6
     total_steps = 10000
-    warmup_steps = 20
+    warmup_steps = int(total_steps * .1)
     optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optim,
@@ -59,11 +59,11 @@ if "__main__" == __name__:
     eval_every = 100
     eval_games = 1000
     eval_seed = 1337
-    train_temperature = 1.6
+    train_temperature = 1.0
     max_seq_len = 384
     groups_per_batch = 4
-    rollouts_per_group = 12
-    kl_coef = 0.2
+    rollouts_per_group = 3
+    kl_coef = 0.1
     entropy_coef = 0.03
     ppo_epochs = 2
 
@@ -88,4 +88,5 @@ if "__main__" == __name__:
         ppo_epochs=ppo_epochs,
         generate_trajectory=blackjack.generate_trajectory,
         game_cls=blackjack.Blackjack,
+        eval_probe_fn=blackjack.eval_probe,
     )

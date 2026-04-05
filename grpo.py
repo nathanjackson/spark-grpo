@@ -107,12 +107,11 @@ def grpo_token_level_loss(
     loss = policy_loss + kl_coef * kl_per_token.mean()
 
     if reduction == "batch":
-        return (loss.sum(-1) / mask.sum(-1)).mean()
+        return (loss.sum(-1) / mask.sum(-1).clamp_min(1.0)).mean()
     elif reduction == "per_sample":
-        return loss.sum(dim=1) / mask.sum(dim=1)
+        return loss.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
     else:
         raise ValueError(f"unknown reduction: {reduction}")
-
 
 def train_grpo(
     *,
@@ -136,6 +135,7 @@ def train_grpo(
     ppo_epochs,
     generate_trajectory,
     game_cls,
+    eval_probe_fn=None,
     eval_iter_factory=None,
 ):
     if eval_iter_factory is None:
@@ -148,15 +148,21 @@ def train_grpo(
         wins = 0
         losses = 0
         pushes = 0
+        hit_probs = []
+        stay_probs = []
         with torch.no_grad():
             for _ in tqdm.tqdm(eval_iter_factory(eval_games)):
                 eval_game = game_cls()
                 eval_game.start_round()
+                if eval_probe_fn is not None:
+                    probe_stats = eval_probe_fn(eval_game, tokenizer, eval_model)
+                    hit_probs.append(probe_stats["p_hit"])
+                    stay_probs.append(probe_stats["p_stay"])
                 eval_traj = generate_trajectory(
                     eval_game,
                     tokenizer,
                     eval_model,
-                    temperature=1.0,
+                    temperature=0.0,
                 )
                 if eval_traj["reward"] == 2.0:
                     wins += 1
@@ -167,21 +173,34 @@ def train_grpo(
         total = wins + losses + pushes
         if total > 0:
             win_rate = wins / total
-            logger.info(
-                "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s",
-                step_label,
-                win_rate,
-                wins,
-                pushes,
-                losses,
-            )
+            if hit_probs:
+                logger.info(
+                    "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s\tp_hit: %.4f\tp_stay: %.4f",
+                    step_label,
+                    win_rate,
+                    wins,
+                    pushes,
+                    losses,
+                    sum(hit_probs) / len(hit_probs),
+                    sum(stay_probs) / len(stay_probs),
+                )
+            else:
+                logger.info(
+                    "[eval] step: %s\twin_rate: %.3f\twins: %s\tpushes: %s\tlosses: %s",
+                    step_label,
+                    win_rate,
+                    wins,
+                    pushes,
+                    losses,
+                )
         checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
         eval_model.save_pretrained(checkpoint_dir)
         random.setstate(py_state)
 
-    run_eval("init", ref_model)
+    #run_eval("init", ref_model)
     for step in range(total_steps):
         batch_ids = None
+        batch_attention_mask = None
         batch_rewards = None
         batch_actions = None
         batch_old_logprobs = None
@@ -209,19 +228,36 @@ def train_grpo(
                 sequence_ids = trajectory["sequence_ids"]
                 if sequence_ids.shape[0] > max_seq_len:
                     sequence_ids = sequence_ids[-max_seq_len:]
+                sequence_attention_mask = torch.ones(
+                    sequence_ids.shape[0],
+                    dtype=torch.long,
+                    device=ref_model.device,
+                )
                 #print("sequence ids shape:", sequence_ids.shape)
                 sequence_padding = torch.full(
                     (max_seq_len - sequence_ids.shape[0],),
                     tokenizer.pad_token_id,
                     dtype=torch.long,
                 ).to(ref_model.device)
+                attention_padding = torch.zeros(
+                    (max_seq_len - sequence_attention_mask.shape[0],),
+                    dtype=torch.long,
+                    device=ref_model.device,
+                )
                 sequence_ids = torch.cat((sequence_ids, sequence_padding)).unsqueeze(0)
+                sequence_attention_mask = torch.cat(
+                    (sequence_attention_mask, attention_padding)
+                ).unsqueeze(0)
                 #print("sequence ids shape:", sequence_ids.shape)
 
                 if batch_ids is None:
                     batch_ids = sequence_ids
+                    batch_attention_mask = sequence_attention_mask
                 else:
                     batch_ids = torch.cat((batch_ids, sequence_ids))
+                    batch_attention_mask = torch.cat(
+                        (batch_attention_mask, sequence_attention_mask)
+                    )
 
                 rewards = trajectory["token_rewards"]
                 if rewards.shape[0] > max_seq_len:
@@ -282,51 +318,42 @@ def train_grpo(
         ref_model.eval()
         # ref_logprobs from a frozen reference model
         with torch.no_grad():
-            ref_logits = ref_model(batch_ids).logits
+            ref_logits = ref_model(
+                batch_ids,
+                attention_mask=batch_attention_mask,
+            ).logits
             ref_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = ref_logprobs[:, :-1, :].gather(
                 -1, batch_ids[:, 1:].unsqueeze(-1)
             ).squeeze(-1)
 
-        #print(f"batch_actions shape before shift: {batch_actions.shape}")
         batch_actions = batch_actions[:, 1:]
         batch_rewards = batch_rewards[:, 1:]
-        #print(f"batch_actions shape after shift: {batch_actions.shape}")
-        #print(f"batch_actions sum: {batch_actions.sum()}")
-        #print(f"batch_rewards unique: {batch_rewards[batch_actions].unique()}")
-        #print(f"First sample action positions: {batch_actions[0].nonzero().squeeze()}")
-        #print(f"batch_actions shape: {batch_actions.shape}")
-        #print(f"batch_actions sum per sample: {batch_actions.sum(dim=1)}")
-        #print(f"batch_rewards shape: {batch_rewards.shape}")
 
-        #IPython.embed()
-        # distribute reward to actions
         valid_rewards = batch_rewards[batch_actions]
         if valid_rewards.numel() == 0:
-            reward_mean = torch.tensor(0.0, device=valid_rewards.device)
-            reward_std = torch.tensor(0.0, device=valid_rewards.device)
+            reward_mean = torch.tensor(0.0, device=ref_model.device)
+            reward_std = torch.tensor(0.0, device=ref_model.device)
         else:
             reward_mean = valid_rewards.mean()
-            reward_std = valid_rewards.std()
-        #batch_rewards = batch_actions * (batch_rewards[:,0] / batch_actions.sum(dim=1)).unsqueeze(0).T
+            reward_std = valid_rewards.std(unbiased=False)
 
-        #valid_rewards = batch_rewards[batch_actions]
-        #print(f"Valid rewards: {valid_rewards}")
-        #print(f"Unique rewards: {valid_rewards.unique()}")
-        #print(f"Reward mean: {valid_rewards.mean()}")
-        #print(f"Reward std: {valid_rewards.std()}")
-        # KL Coef for stability
         group_ids = torch.tensor(
             batch_group_ids,
             device=batch_ids.device,
             dtype=torch.long,
         )
+
         last_loss = None
         last_grad_norm = None
         last_policy_logprobs = None
+        last_entropy = None
         for _ in range(ppo_epochs):
             policy_model.eval()
-            policy_logits = policy_model(batch_ids).logits
+            policy_logits = policy_model(
+                batch_ids,
+                attention_mask=batch_attention_mask,
+            ).logits
             policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
             policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
                 -1, batch_ids[:, 1:].unsqueeze(-1)
@@ -352,7 +379,7 @@ def train_grpo(
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 policy_model.parameters(),
-                max_norm=1.0,
+                max_norm=0.1,
             )
             if grad_norm == 0.0 and loss.item() != 0.0:
                 valid_action_count = batch_actions.sum().item()
@@ -375,6 +402,7 @@ def train_grpo(
             last_loss = loss
             last_grad_norm = grad_norm
             last_policy_logprobs = policy_logprobs.detach()
+            last_entropy = entropy_mean.mean().detach()
 
         lr = None
         for param_group in optim.param_groups:
@@ -391,6 +419,7 @@ def train_grpo(
         policy_logprobs = last_policy_logprobs
         loss = last_loss
         grad_norm = last_grad_norm
+        entropy_mean = last_entropy
         ratio = torch.exp(policy_logprobs - batch_old_logprobs)
         if batch_actions.any():
             ratio_vals = ratio[batch_actions]
@@ -403,7 +432,7 @@ def train_grpo(
             valid_action_tokens = 0
         logger.info(
             "step: %s\tloss: %.20f\tgrad_norm: %.8f\tlr: %s\treward_mean: %.4f\treward_std: %.4f"
-            "\tsample_reward_std: %.6f\tadv_abs_mean: %.6f\tratio_mean: %.6f\tratio_std: %.6f\tvalid_action_tokens: %s",
+            "\tsample_reward_std: %.6f\tadv_abs_mean: %.6f\tentropy: %.6f\tratio_mean: %.6f\tratio_std: %.6f\tvalid_action_tokens: %s",
             step,
             loss.item(),
             grad_norm,
@@ -412,6 +441,7 @@ def train_grpo(
             reward_std.item(),
             sample_rewards_std.item(),
             adv_abs_mean.item(),
+            entropy_mean.item(),
             ratio_mean.item(),
             ratio_std.item(),
             valid_action_tokens,

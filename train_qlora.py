@@ -10,6 +10,7 @@ import blackjack
 from grpo import train_grpo
 
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+import bitsandbytes as bnb
 
 
 if "__main__" == __name__:
@@ -35,7 +36,7 @@ if "__main__" == __name__:
         bnb_4bit_compute_dtype=torch.bfloat16
     )
 
-    model_id = "ibm-granite/granite-4.0-micro"
+    model_id = "mistralai/Mistral-7B-Instruct-v0.3"
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
@@ -48,7 +49,6 @@ if "__main__" == __name__:
     policy_model = prepare_model_for_kbit_training(policy_model)
 
     lora_config = LoraConfig(
-        # rule of thumb: for dense rewards, use 32+ for rank. since we're doing token-level rewards, we have dense rewards
         r=32,
         lora_alpha=32,
         target_modules="all-linear",
@@ -58,10 +58,11 @@ if "__main__" == __name__:
     )
     policy_model = get_peft_model(policy_model, lora_config)
 
-    base_lr = 5e-5
+    base_lr = 5e-6
     total_steps = 10000
-    warmup_steps = 20
-    optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
+    warmup_steps = int(total_steps * .1)
+    #optim = torch.optim.AdamW(policy_model.parameters(), lr=base_lr, fused=True)
+    optim = bnb.optim.AdamW8bit(policy_model.parameters(), lr=base_lr)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optim,
         start_factor=1.0 / max(1, warmup_steps),
@@ -81,11 +82,11 @@ if "__main__" == __name__:
     eval_every = 100
     eval_games = 1000
     eval_seed = 1337
-    train_temperature = 1.6
+    train_temperature = 1.0
     max_seq_len = 384
-    groups_per_batch = 2
-    rollouts_per_group = 6
-    kl_coef = 0.2
+    groups_per_batch = 4
+    rollouts_per_group = 3
+    kl_coef = 0.1
     entropy_coef = 0.03
     ppo_epochs = 2
 
@@ -110,4 +111,5 @@ if "__main__" == __name__:
         ppo_epochs=ppo_epochs,
         generate_trajectory=blackjack.generate_trajectory,
         game_cls=blackjack.Blackjack,
+        eval_probe_fn=blackjack.eval_probe,
     )
