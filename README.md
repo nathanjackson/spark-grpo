@@ -29,6 +29,10 @@ Spark.
 
         python3 train.py
 
+   To split each PPO batch across multiple backward passes before a single
+   optimizer step, increase `gradient_accumulation_steps` in `train.py` or
+   `train_qlora.py`.
+
 5. Test - There is also a test script that you can use to compare the win rates
    of the original model against your checkpoint.
 
@@ -37,4 +41,3 @@ Spark.
 
         # Your checkpoint
         python3 test_play.py --model-path <path to checkpoint folder> --games 1000
-

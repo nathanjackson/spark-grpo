@@ -84,6 +84,9 @@ if "__main__" == __name__:
     eval_seed = 1337
     train_temperature = 1.0
     max_seq_len = 384
+    # Batch Size = groups_per_batch * rollouts_per_group
+    # Each PPO batch is split across this many backward passes before one optimizer step.
+    gradient_accumulation_steps = 4
     groups_per_batch = 4
     rollouts_per_group = 3
     kl_coef = 0.1
@@ -106,6 +109,7 @@ if "__main__" == __name__:
         max_seq_len=max_seq_len,
         groups_per_batch=groups_per_batch,
         rollouts_per_group=rollouts_per_group,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         kl_coef=kl_coef,
         entropy_coef=entropy_coef,
         ppo_epochs=ppo_epochs,

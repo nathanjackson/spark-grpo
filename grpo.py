@@ -11,6 +11,98 @@ import tqdm
 # B = Batch Size
 # T = Tokens
 
+def grpo_advantages(
+    rewards: torch.Tensor,
+    mask: torch.Tensor,
+    group_ids: torch.Tensor | None = None,
+    eps: float = 1e-8,
+):
+    assert 2 == mask.ndim
+    assert rewards.ndim == mask.ndim
+    assert rewards.shape == mask.shape
+
+    rewards = rewards.detach()
+    mask = mask.detach()
+
+    mask_f = mask.float()
+    denom = mask_f.sum(dim=1).clamp_min(1.0)
+    sample_rewards = (rewards * mask_f).sum(dim=1) / denom
+    if sample_rewards.numel() == 0:
+        return torch.zeros_like(rewards)
+    if group_ids is None:
+        mean = sample_rewards.mean()
+        std = sample_rewards.std(unbiased=False).clamp(min=eps)
+        return ((sample_rewards - mean) / std).unsqueeze(1) * mask_f
+
+    group_ids = group_ids.to(sample_rewards.device)
+    global_mean = sample_rewards.mean()
+    global_std = sample_rewards.std(unbiased=False).clamp(min=eps)
+    means = torch.zeros_like(sample_rewards)
+    stds = torch.zeros_like(sample_rewards)
+    for gid in torch.unique(group_ids):
+        grp_mask = group_ids == gid
+        grp_rewards = sample_rewards[grp_mask]
+        if grp_rewards.numel() == 0:
+            continue
+        grp_mean = grp_rewards.mean()
+        grp_std = grp_rewards.std(unbiased=False)
+        # If within-group variance collapses, fall back to global normalization.
+        if grp_rewards.numel() < 2 or grp_std < 1e-6:
+            means[grp_mask] = global_mean
+            stds[grp_mask] = global_std
+        else:
+            means[grp_mask] = grp_mean
+            stds[grp_mask] = grp_std.clamp(min=eps)
+    return ((sample_rewards - means) / stds).unsqueeze(1) * mask_f
+
+def grpo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    reduction: str = "batch",
+):
+    assert 2 == log_probs.ndim
+    assert 2 == mask.ndim
+    assert log_probs.shape == old_log_probs.shape
+    assert log_probs.shape == advantages.shape
+    assert log_probs.shape == mask.shape
+
+    old_log_probs = old_log_probs.detach()
+    advantages = advantages.detach()
+    mask = mask.detach()
+
+    ratio = torch.exp(log_probs - old_log_probs)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * advantages
+    policy_loss = -1.0 * torch.minimum(surr1, surr2) * mask
+
+    per_sample_loss = policy_loss.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+    if reduction == "batch":
+        return per_sample_loss.mean()
+    if reduction == "per_sample":
+        return per_sample_loss
+    if reduction == "none":
+        return policy_loss
+    raise ValueError(f"unknown reduction: {reduction}")
+
+def grpo_kl_per_token(
+    log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    mask: torch.Tensor,
+):
+    assert 2 == log_probs.ndim
+    assert 2 == mask.ndim
+    assert log_probs.shape == ref_log_probs.shape
+    assert log_probs.shape == mask.shape
+
+    ref_log_probs = ref_log_probs.detach()
+    mask = mask.detach()
+
+    ref_probs = ref_log_probs.exp()
+    kl_per_token = ref_probs * (ref_log_probs - log_probs)
+    return kl_per_token * mask
+
 def grpo_token_level_loss(
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
@@ -48,70 +140,32 @@ def grpo_token_level_loss(
     assert rewards.shape == mask.shape
     assert log_probs.shape == rewards.shape
 
-    # don't propagate backwards through rewards, mask, and reference log probs
-    rewards = rewards.detach()
-    old_log_probs = old_log_probs.detach()
-    ref_log_probs = ref_log_probs.detach()
-    mask = mask.detach()
-
-    # compute mean/std over trajectories (one reward per sample)
-    mask_f = mask.float()
-    denom = mask_f.sum(dim=1).clamp_min(1.0)
-    sample_rewards = (rewards * mask_f).sum(dim=1) / denom
-    if sample_rewards.numel() == 0:
-        # no valid tokens; return zero loss with grad
-        return (log_probs * 0).sum()
-    if group_ids is None:
-        mean = sample_rewards.mean()
-        std = sample_rewards.std(unbiased=False).clamp(min=eps)
-        # normalized advantages (avoid zeroing; keeps gradient signal when rewards collapse)
-        adv = ((sample_rewards - mean) / std).unsqueeze(1) * mask_f
-    else:
-        group_ids = group_ids.to(sample_rewards.device)
-        global_mean = sample_rewards.mean()
-        global_std = sample_rewards.std(unbiased=False).clamp(min=eps)
-        means = torch.zeros_like(sample_rewards)
-        stds = torch.zeros_like(sample_rewards)
-        for gid in torch.unique(group_ids):
-            grp_mask = group_ids == gid
-            grp_rewards = sample_rewards[grp_mask]
-            if grp_rewards.numel() == 0:
-                continue
-            grp_mean = grp_rewards.mean()
-            grp_std = grp_rewards.std(unbiased=False)
-            # If within-group variance collapses, fall back to global normalization
-            if grp_rewards.numel() < 2 or grp_std < 1e-6:
-                means[grp_mask] = global_mean
-                stds[grp_mask] = global_std
-            else:
-                means[grp_mask] = grp_mean
-                stds[grp_mask] = grp_std.clamp(min=eps)
-        adv = ((sample_rewards - means) / stds).unsqueeze(1) * mask_f
-
-    # importance weights
-    ratio = torch.exp(log_probs - old_log_probs)
-    surr1 = ratio * adv
-    surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * adv
-    #w = torch.exp(log_probs - ref_log_probs)
-
-    # policy loss per token
-    policy_loss = -1. * torch.minimum(surr1, surr2) * mask
-    #policy_loss = -(w * adv) * mask
-
-    # KL term
-    policy_probs = log_probs.exp()
-    ref_probs = ref_log_probs.exp()
-    kl_per_token = ref_probs * (ref_log_probs - log_probs)
-    kl_per_token = kl_per_token * mask
-
-    loss = policy_loss + kl_coef * kl_per_token.mean()
+    advantages = grpo_advantages(
+        rewards,
+        mask,
+        group_ids=group_ids,
+        eps=eps,
+    )
+    policy_loss = grpo_policy_loss(
+        log_probs,
+        old_log_probs,
+        advantages,
+        mask,
+        reduction="per_sample",
+    )
+    kl_mean = grpo_kl_per_token(
+        log_probs,
+        ref_log_probs,
+        mask,
+    ).mean()
+    kl_weight = log_probs.shape[1] / mask.sum(dim=1).clamp_min(1.0)
+    loss = policy_loss + kl_coef * kl_mean * kl_weight
 
     if reduction == "batch":
-        return (loss.sum(-1) / mask.sum(-1).clamp_min(1.0)).mean()
-    elif reduction == "per_sample":
-        return loss.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-    else:
-        raise ValueError(f"unknown reduction: {reduction}")
+        return loss.mean()
+    if reduction == "per_sample":
+        return loss
+    raise ValueError(f"unknown reduction: {reduction}")
 
 def train_grpo(
     *,
@@ -130,6 +184,7 @@ def train_grpo(
     max_seq_len,
     groups_per_batch,
     rollouts_per_group,
+    gradient_accumulation_steps,
     kl_coef,
     entropy_coef,
     ppo_epochs,
@@ -140,6 +195,8 @@ def train_grpo(
 ):
     if eval_iter_factory is None:
         eval_iter_factory = range
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
 
     def run_eval(step_label, eval_model):
         py_state = random.getstate()
@@ -343,45 +400,93 @@ def train_grpo(
             device=batch_ids.device,
             dtype=torch.long,
         )
+        batch_advantages = grpo_advantages(
+            batch_rewards,
+            batch_actions,
+            group_ids=group_ids,
+        )
+        batch_size = batch_ids.shape[0]
+        seq_len = batch_actions.shape[1]
+        total_token_count = batch_actions.numel()
+        kl_weight = (
+            seq_len / batch_actions.sum(dim=1).clamp_min(1.0).float()
+        ).mean()
+        microbatch_count = max(1, min(int(gradient_accumulation_steps), batch_size))
 
         last_loss = None
         last_grad_norm = None
         last_policy_logprobs = None
         last_entropy = None
         for _ in range(ppo_epochs):
-            policy_model.eval()
-            policy_logits = policy_model(
-                batch_ids,
-                attention_mask=batch_attention_mask,
-            ).logits
-            policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
-            policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
-                -1, batch_ids[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-
-            loss = grpo_token_level_loss(
-                policy_logprobs,
-                batch_old_logprobs,
-                ref_logprobs,
-                batch_rewards,
-                batch_actions,
-                group_ids=group_ids,
-                kl_coef=kl_coef,
-            )
-            entropy = -(policy_logprobs_full.exp() * policy_logprobs_full).sum(dim=-1)[:, :-1]
-            entropy_denom = batch_actions.sum(dim=1).clamp_min(1.0)
-            entropy_mean = (entropy * batch_actions).sum(dim=1) / entropy_denom
-            loss = loss - entropy_coef * entropy_mean.mean()
-
-            policy_model.train()
             optim.zero_grad()
-            loss.backward()
+            epoch_policy_loss = torch.zeros((), device=batch_ids.device)
+            epoch_kl_sum = torch.zeros((), device=batch_ids.device)
+            epoch_entropy = torch.zeros((), device=batch_ids.device)
+            policy_logprobs_chunks = []
+            loss_requires_grad = None
+            policy_logprobs_requires_grad = None
+            for microbatch_idx in range(microbatch_count):
+                start = (microbatch_idx * batch_size) // microbatch_count
+                end = ((microbatch_idx + 1) * batch_size) // microbatch_count
+                if start >= end:
+                    continue
+
+                batch_slice = slice(start, end)
+                policy_model.eval()
+                policy_logits = policy_model(
+                    batch_ids[batch_slice],
+                    attention_mask=batch_attention_mask[batch_slice],
+                ).logits
+                policy_logprobs_full = F.log_softmax(policy_logits, dim=-1)
+                policy_logprobs = policy_logprobs_full[:, :-1, :].gather(
+                    -1, batch_ids[batch_slice, 1:].unsqueeze(-1)
+                ).squeeze(-1)
+
+                policy_loss_per_sample = grpo_policy_loss(
+                    policy_logprobs,
+                    batch_old_logprobs[batch_slice],
+                    batch_advantages[batch_slice],
+                    batch_actions[batch_slice],
+                    reduction="per_sample",
+                )
+                kl_per_token = grpo_kl_per_token(
+                    policy_logprobs,
+                    ref_logprobs[batch_slice],
+                    batch_actions[batch_slice],
+                )
+                entropy = -(policy_logprobs_full.exp() * policy_logprobs_full).sum(dim=-1)[:, :-1]
+                entropy_denom = batch_actions[batch_slice].sum(dim=1).clamp_min(1.0)
+                entropy_mean = (
+                    (entropy * batch_actions[batch_slice]).sum(dim=1) / entropy_denom
+                )
+
+                loss = policy_loss_per_sample.sum() / batch_size
+                loss = loss + kl_coef * kl_weight * kl_per_token.sum() / total_token_count
+                loss = loss - entropy_coef * entropy_mean.sum() / batch_size
+                loss_requires_grad = loss.requires_grad
+                policy_logprobs_requires_grad = policy_logprobs.requires_grad
+
+                policy_model.train()
+                loss.backward()
+
+                epoch_policy_loss = epoch_policy_loss + policy_loss_per_sample.detach().sum()
+                epoch_kl_sum = epoch_kl_sum + kl_per_token.detach().sum()
+                epoch_entropy = epoch_entropy + entropy_mean.detach().sum()
+                policy_logprobs_chunks.append(policy_logprobs.detach())
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 policy_model.parameters(),
                 max_norm=0.1,
             )
-            if grad_norm == 0.0 and loss.item() != 0.0:
+            last_loss = (
+                epoch_policy_loss / batch_size
+                + kl_coef * kl_weight * epoch_kl_sum / total_token_count
+                - entropy_coef * epoch_entropy / batch_size
+            )
+            last_grad_norm = grad_norm
+            last_policy_logprobs = torch.cat(policy_logprobs_chunks, dim=0)
+            last_entropy = epoch_entropy / batch_size
+            if grad_norm == 0.0 and last_loss.item() != 0.0:
                 valid_action_count = batch_actions.sum().item()
                 any_grad = any(
                     (p.grad is not None) and torch.any(p.grad != 0).item()
@@ -393,16 +498,12 @@ def train_grpo(
                     "\tpolicy_logprobs_requires_grad: %s"
                     "\tvalid_action_tokens: %s"
                     "\tany_nonzero_grad: %s",
-                    loss.requires_grad,
-                    policy_logprobs.requires_grad,
+                    loss_requires_grad,
+                    policy_logprobs_requires_grad,
                     int(valid_action_count),
                     any_grad,
                 )
             optim.step()
-            last_loss = loss
-            last_grad_norm = grad_norm
-            last_policy_logprobs = policy_logprobs.detach()
-            last_entropy = entropy_mean.mean().detach()
 
         lr = None
         for param_group in optim.param_groups:
