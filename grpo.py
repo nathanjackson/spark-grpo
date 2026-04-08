@@ -5,11 +5,51 @@ import random
 import torch
 import torch.nn.functional as F
 import tqdm
+from safetensors.torch import load_file
+
+try:
+    from peft import get_peft_model_state_dict
+except ImportError:
+    get_peft_model_state_dict = None
 
 
 # Shape Constant Meanings:
 # B = Batch Size
 # T = Tokens
+
+
+def _verify_saved_adapter_checkpoint(logger, model, checkpoint_dir):
+    if get_peft_model_state_dict is None or not hasattr(model, "peft_config"):
+        return
+
+    adapter_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
+    if not os.path.exists(adapter_path):
+        logger.warning("[checkpoint] adapter weights missing at %s", adapter_path)
+        return
+
+    saved_state = load_file(adapter_path)
+    live_state = {
+        key: value.detach().cpu()
+        for key, value in get_peft_model_state_dict(model).items()
+    }
+
+    saved_keys = set(saved_state.keys())
+    live_keys = set(live_state.keys())
+    if saved_keys != live_keys:
+        logger.error(
+            "[checkpoint] saved adapter key mismatch: missing=%s extra=%s",
+            sorted(live_keys - saved_keys)[:10],
+            sorted(saved_keys - live_keys)[:10],
+        )
+        return
+
+    max_abs_diff = 0.0
+    for key in saved_keys:
+        diff = (saved_state[key] - live_state[key]).abs().max().item()
+        max_abs_diff = max(max_abs_diff, diff)
+
+    logger.info("[checkpoint] adapter save verification max_abs_diff=%.8e", max_abs_diff)
+
 
 def grpo_advantages(
     rewards: torch.Tensor,
@@ -252,6 +292,7 @@ def train_grpo(
                 )
         checkpoint_dir = os.path.join(run_dir, f"checkpoint_{step_label}")
         eval_model.save_pretrained(checkpoint_dir)
+        _verify_saved_adapter_checkpoint(logger, eval_model, checkpoint_dir)
         random.setstate(py_state)
 
     #run_eval("init", ref_model)

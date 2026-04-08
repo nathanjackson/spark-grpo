@@ -13,6 +13,24 @@ from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 import bitsandbytes as bnb
 
 
+def _log_trainable_parameters(logger, model):
+    trainable = [
+        (name, param.numel())
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    total = sum(numel for _, numel in trainable)
+    logger.info("trainable parameter tensors: %s", len(trainable))
+    logger.info("trainable parameter count: %s", total)
+
+    non_lora = [name for name, _ in trainable if ".lora_" not in name]
+    if non_lora:
+        raise RuntimeError(
+            "Found trainable non-LoRA parameters that will not be captured by "
+            f"adapter-only checkpointing: {non_lora[:10]}"
+        )
+
+
 if "__main__" == __name__:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join("runs", f"grpo_{timestamp}")
@@ -42,6 +60,8 @@ if "__main__" == __name__:
     tokenizer.pad_token = tokenizer.eos_token
     ref_model = transformers.AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config).to("cuda")
     ref_model.eval()
+    base_revision = getattr(ref_model.config, "_commit_hash", None)
+    logger.info("base model revision: %s", base_revision)
     for param in ref_model.parameters():
         param.requires_grad = False  # Freeze all parameters
     policy_model = transformers.AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config).to("cuda")
@@ -54,9 +74,11 @@ if "__main__" == __name__:
         target_modules="all-linear",
         lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        revision=base_revision,
     )
     policy_model = get_peft_model(policy_model, lora_config)
+    _log_trainable_parameters(logger, policy_model)
 
     base_lr = 5e-6
     total_steps = 10000
